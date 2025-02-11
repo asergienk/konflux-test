@@ -674,10 +674,17 @@ EOF
         }
     ]
 }
+{
+    "schema": "olm.bundle",
+    "name": "kubevirt-hyperconverged-operator.v4.17.5",
+    "package": "kubevirt-hyperconverged-v1",
+    "image": "registry.redhat.io/container-native-virtualization/hco-bundle-registry@sha256:4f100135ccbfc726f4b1887703ef7a08453b48c202ba04c0fb7382f0fec637db",
+    "properties": []
+}
 EOF
 )
     run get_highest_bundle_version "${RENDER_OUT_FBC}" "${PACKAGE_NAME}" "${CHANNEL_NAME}"
-    EXPECTED_RESPONSE="kubevirt-hyperconverged-operator.v4.17.5"
+    EXPECTED_RESPONSE="registry.redhat.io/container-native-virtualization/hco-bundle-registry@sha256:4f100135ccbfc726f4b1887703ef7a08453b48c202ba04c0fb7382f0fec637db"
     echo "${output}"
     [[ "${EXPECTED_RESPONSE}" = "${output}" && "$status" -eq 0 ]]
 }
