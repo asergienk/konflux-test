@@ -1256,6 +1256,12 @@ parse_collected_image_pulls() {
   local image_pull_events_file="$1"
   local deployment_start_time="$2"
 
+  # Validate input parameters
+  if [[ -z "$image_pull_events_file" || -z "$deployment_start_time" ]]; then
+    echo "parse_collected_image_pulls: Invalid input. Usage: parse_collected_image_pulls <image_pull_events_file> <deployment_start_time>" >&2
+    exit 2
+  fi
+
   awk -v start="$deployment_start_time" -F',' '
     {
       if ($1 >= start) {
@@ -1272,4 +1278,45 @@ parse_collected_image_pulls() {
       }
     }
   ' "$image_pull_events_file" | sort
+}
+
+# This function will be used by tasks in tekton-integration-catalog
+collect_images_from_scorecard_config() {
+  local scorecard_config_yaml="$1"
+  local images=()
+
+  if ! echo "${scorecard_config_yaml}" | yq '.' &>/dev/null; then
+    echo "collect_images_from_scorecard_config: Invalid YAML input" >&2
+    exit 2
+  fi
+
+  # Check if 'stages' key exists
+  if [[ "$(yq e '.stages' "$scorecard_config_yaml")" == "null" ]]; then
+    return 0
+  fi
+
+  local stage_count
+  stage_count=$(yq e '.stages | length' "$scorecard_config_yaml")
+
+  for (( i=0; i<stage_count; i++ )); do
+    if [[ "$(yq e ".stages[$i].tests" "$scorecard_config_yaml")" == "null" ]]; then
+      continue
+    fi
+
+    local test_count
+    test_count=$(yq e ".stages[$i].tests | length" "$scorecard_config_yaml")
+
+    for (( j=0; j<test_count; j++ )); do
+      local image
+      image=$(yq e -r ".stages[$i].tests[$j].image" "$scorecard_config_yaml")
+      if [[ -n "$image" && "$image" != "null" ]]; then
+        images+=("$image")
+      fi
+    done
+  done
+
+  # Print unique images, one per line
+  if (( ${#images[@]} > 0 )); then
+    printf "%s\n" "${images[@]}" | sort -u
+  fi
 }

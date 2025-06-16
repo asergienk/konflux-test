@@ -1247,3 +1247,47 @@ EOF
 
     [[ "${EXPECTED_RESPONSE}" = "${output}" && "$status" -eq 0 ]]
 }
+
+@test "Collect images from scorecard config: success" {
+    scorecard_config_yaml=$(cat <<EOF
+---
+apiVersion: scorecard.operatorframework.io/v1alpha3
+kind: Configuration
+metadata:
+  name: config
+stages:
+- parallel: true
+  tests:
+  - entrypoint:
+    - scorecard-test
+    - basic-check-spec
+    image: quay.io/operator-framework/scorecard-test:v1.31.0
+    labels:
+      suite: basic
+      test: basic-check-spec-test
+    storage:
+      spec:
+        mountPath: {}
+  - entrypoint:
+    - scorecard-test
+    - olm-bundle-validation
+    image: quay.io/operator-framework/scorecard-test:v1.33.0
+    labels:
+      suite: olm
+      test: olm-bundle-validation-test
+    storage:
+      spec:
+        mountPath: {}
+storage:
+  spec:
+    mountPath: {}
+EOF
+)
+
+    run collect_images_from_scorecard_config "$scorecard_config_yaml"
+
+    EXPECTED_RESPONSE=$'quay.io/operator-framework/scorecard-test:v1.31.0\nquay.io/operator-framework/scorecard-test:v1.33.0'
+
+    [[ "${EXPECTED_RESPONSE}" = "${output}" && "$status" -eq 0 ]]
+}
+
