@@ -1322,3 +1322,249 @@ collect_scorecard_config_images() {
     printf "%s\n" "${images[@]}" | sort -u
   fi
 }
+
+# This function will be used by tasks in tekton-integration-catalog
+# Given registry, repo, image digest, and layer digest list, this function queries the Pyxis public API to determine whether a container image is published and certified.
+# It matches by image digest first, then by uncompressed layer IDs if needed.
+# It returns a JSON map: { "certified": "<true/false/Not found>", "published": "<true/false/Not found>" }
+get_image_published_and_certified_status() {
+  local registry="$1"
+  local repo="$2"
+  local digest="$3"
+  shift 3  # Remove first three args
+  local layerDigestList=("$@")  # The rest is the array
+
+  # Validate input parameters
+  if [[ -z "$registry" || -z "$repo" || -z "$digest" || ${#layerDigestList[@]} -eq 0 ]]; then
+    echo "get_image_published_and_certified_status: Invalid input. Usage: get_image_published_and_certified_status <registry> <repo> <digest> <layerDigestList>" >&2
+    exit 2
+  fi
+
+  local PAGE=0
+  local PAGE_SIZE=500
+  local HAS_MORE=true
+  local CERTIFIED="Not found"
+  local PUBLISHED="Not found"
+
+  while $HAS_MORE; do
+    local RESPONSE=$(curl -s 'https://catalog.redhat.com/api/containers/graphql/' \
+      -X POST \
+      -H 'Content-Type: application/json' \
+      --data-raw "$(jq -nc --arg repo "$repo" --arg registry "$registry" --argjson page $PAGE '{
+        query: "query ImagePublishedAndCertifiedStatus($repo: String!, $registry: String!, $page: Int!) { results: find_images(page_size: 500, page: $page, filter: { and: [ { repositories: { repository: { eq: $repo } } }, { repositories: { registry: { eq: $registry } } } ] }) { page page_size total error { status detail } data { repositories { repository registry published } parsed_data { uncompressed_layer_sizes { layer_id } } docker_image_digest certified } } }",
+        variables: {
+          repo: $repo,
+          registry: $registry,
+          page: $page
+        }
+      }')")
+
+    local TOTAL=$(echo "$RESPONSE" | jq '.data.results.total')
+    local CURRENT_PAGE=$(echo "$RESPONSE" | jq '.data.results.page')
+    local PAGE_SIZE_RESP=$(echo "$RESPONSE" | jq '.data.results.page_size')
+
+    # loop through results
+    local MATCH_COUNT=$(echo "$RESPONSE" | jq '.data.results.data | length')
+
+    if [ "$MATCH_COUNT" -eq 0 ]; then
+      break
+    fi
+
+    # Check by digest match first
+    for row in $(echo "$RESPONSE" | jq -c '.data.results.data[]'); do
+      local rec_digest=$(echo "$row" | jq -r '.docker_image_digest')
+
+      if [ "$rec_digest" == "$digest" ]; then
+        CERTIFIED=$(echo "$row" | jq -r '.certified')
+        for repo_item in $(echo "$row" | jq -c '.repositories[]'); do
+          local reg=$(echo "$repo_item" | jq -r '.registry')
+          local rep=$(echo "$repo_item" | jq -r '.repository')
+          if [ "$reg" == "$registry" ] && [ "$rep" == "$repo" ]; then
+            PUBLISHED=$(echo "$repo_item" | jq -r '.published')
+            break
+          fi
+        done
+      fi
+    done
+
+    # Check by uncompressed layer IDs if not found yet
+    if [ "$CERTIFIED" == "Not found" ] || [ "$PUBLISHED" == "Not found" ]; then
+      for row in $(echo "$RESPONSE" | jq -c '.data.results.data[]'); do
+        mapfile -t ulids < <(echo "$row" | jq -r '.parsed_data.uncompressed_layer_sizes[].layer_id')
+
+        # Turn arrays into strings with sorted elements
+        local ulids_sorted
+        local layerDigestList_sorted
+
+        ulids_sorted=$(printf "%s\n" "${ulids[@]}" | sort | tr '\n' ' ')
+        layerDigestList_sorted=$(printf "%s\n" "${layerDigestList[@]}" | sort | tr '\n' ' ')
+
+        if [ "$ulids_sorted" == "$layerDigestList_sorted" ]; then
+          CERTIFIED=$(echo "$row" | jq -r '.certified')
+          for repo_item in $(echo "$row" | jq -c '.repositories[]'); do
+            local reg=$(echo "$repo_item" | jq -r '.registry')
+            local rep=$(echo "$repo_item" | jq -r '.repository')
+            if [ "$reg" == "$registry" ] && [ "$rep" == "$repo" ]; then
+              PUBLISHED=$(echo "$repo_item" | jq -r '.published')
+              break
+            fi
+          done
+        fi
+      done
+    fi
+
+    local NEXT_PAGE=$((PAGE + 1))
+    if [ $((PAGE_SIZE_RESP * (CURRENT_PAGE + 1))) -ge "$TOTAL" ]; then
+      HAS_MORE=false
+    else
+      PAGE=$NEXT_PAGE
+    fi
+  done
+
+  jq -nc --arg certified "$CERTIFIED" --arg published "$PUBLISHED" '{ certified: $certified, published: $published }'
+}
+
+handle_pyxis_response_pages() {
+  local url="$1"           # e.g., https://catalog.redhat.com/api/containers/graphql/
+  local http_method="$2"   # e.g., POST or GET
+  local headers_json="$3"  # e.g., '{"Content-Type":"application/json","Authorization":"Bearer XXX"}'
+  local query="$4"         # GraphQL or query string
+  local variables_json="$5"
+
+  local PAGE=0
+  local HAS_MORE=true
+  local ALL_ROWS=()
+
+  while $HAS_MORE; do
+    # Prepare request payload
+    local request_payload
+    request_payload=$(jq -nc \
+      --arg query "$query" \
+      --argjson variables "$(echo "$variables_json" | jq --argjson page "$PAGE" '.page = $page')" \
+      '{ query: $query, variables: $variables }')
+
+    # Prepare curl options for headers
+    local curl_headers=()
+    for row in $(echo "$headers_json" | jq -r 'to_entries[] | @base64'); do
+      _jq() { echo "${row}" | base64 --decode | jq -r "${1}"; }
+      curl_headers+=("-H" "$(_jq '.key'): $(_jq '.value')")
+    done
+
+    # Execute curl request
+    local RESPONSE
+    RESPONSE=$(curl -s "$url" \
+      -X "$http_method" \
+      "${curl_headers[@]}" \
+      --data-raw "$request_payload")
+
+    local TOTAL
+    TOTAL=$(echo "$RESPONSE" | jq '.data.results.total')
+    local PAGE_SIZE
+    PAGE_SIZE=$(echo "$RESPONSE" | jq '.data.results.page_size')
+    local CURRENT_PAGE
+    CURRENT_PAGE=$(echo "$RESPONSE" | jq '.data.results.page')
+
+    mapfile -t PAGE_ROWS < <(echo "$RESPONSE" | jq -c '.data.results.data[]')
+    ALL_ROWS+=("${PAGE_ROWS[@]}")
+
+    if [ $((PAGE_SIZE * (CURRENT_PAGE + 1))) -ge "$TOTAL" ]; then
+      HAS_MORE=false
+    else
+      PAGE=$((PAGE + 1))
+    fi
+  done
+
+  printf '%s\n' "${ALL_ROWS[@]}"
+}
+
+get_image_published_and_certified_status_two() {
+  local registry="$1"
+  local repo="$2"
+  local digest="$3"
+  shift 3
+  local layerDigestList=("$@")
+
+  if [[ -z "$registry" || -z "$repo" || -z "$digest" || ${#layerDigestList[@]} -eq 0 ]]; then
+    echo "Invalid input" >&2
+    exit 2
+  fi
+
+  local query_string='
+    query ImagePublishedAndCertifiedStatus(
+      $repo: String!
+      $registry: String!
+      $page: Int!
+    ) {
+      results: find_images(
+        page_size: 500
+        page: $page
+        filter: {
+          and: [
+            { repositories: { repository: { eq: $repo } } }
+            { repositories: { registry: { eq: $registry } } }
+          ]
+        }
+      ) {
+        page
+        page_size
+        total
+        data {
+          repositories { repository registry published }
+          parsed_data { uncompressed_layer_sizes { layer_id } }
+          docker_image_digest
+          certified
+        }
+      }
+    }'
+
+  local variables_json
+  variables_json=$(jq -nc \
+    --arg repo "$repo" \
+    --arg registry "$registry" \
+    '{ repo: $repo, registry: $registry, page: 0 }')
+
+  local url="https://catalog.redhat.com/api/containers/graphql/"
+  local http_method="POST"
+  local headers_json='{"Content-Type":"application/json"}'
+
+  mapfile -t RESULTS < <(handle_pyxis_response_pages "$url" "$http_method" "$headers_json" "$query_string" "$variables_json")
+
+  local CERTIFIED="Not found"
+  local PUBLISHED="Not found"
+
+  for row in "${RESULTS[@]}"; do
+    local rec_digest
+    rec_digest=$(echo "$row" | jq -r '.docker_image_digest')
+    if [ "$rec_digest" == "$digest" ]; then
+      CERTIFIED=$(echo "$row" | jq -r '.certified')
+      for repo_item in $(echo "$row" | jq -c '.repositories[]'); do
+        local reg=$(echo "$repo_item" | jq -r '.registry')
+        local rep=$(echo "$repo_item" | jq -r '.repository')
+        if [ "$reg" == "$registry" ] && [ "$rep" == "$repo" ]; then
+          PUBLISHED=$(echo "$repo_item" | jq -r '.published')
+          break
+        fi
+      done
+    fi
+  done
+
+  if [ "$CERTIFIED" == "Not found" ] || [ "$PUBLISHED" == "Not found" ]; then
+    for row in "${RESULTS[@]}"; do
+      mapfile -t ulids < <(echo "$row" | jq -r '.parsed_data.uncompressed_layer_sizes[].layer_id')
+      if [[ "${ulids[*]}" == "${layerDigestList[*]}" ]]; then
+        CERTIFIED=$(echo "$row" | jq -r '.certified')
+        for repo_item in $(echo "$row" | jq -c '.repositories[]'); do
+          local reg=$(echo "$repo_item" | jq -r '.registry')
+          local rep=$(echo "$repo_item" | jq -r '.repository')
+          if [ "$reg" == "$registry" ] && [ "$rep" == "$repo" ]; then
+            PUBLISHED=$(echo "$repo_item" | jq -r '.published')
+            break
+          fi
+        done
+      fi
+    done
+  fi
+
+  jq -nc --arg certified "$CERTIFIED" --arg published "$PUBLISHED" \
+    '{ certified: $certified, published: $published }'
+}

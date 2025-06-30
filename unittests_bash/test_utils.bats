@@ -1366,3 +1366,210 @@ EOF
     EXPECTED_RESPONSE="quay.io/operator-framework/scorecard-test:v1.31.0"
     [[ "${EXPECTED_RESPONSE}" = "${output}" && "$status" -eq 0 ]]
 }
+
+@test "Get image published and certified status: invalid input" {
+    run get_image_published_and_certified_status "registry.access.redhat.com" "rhel7/doesnotmatch" "temp:sha256:640e681a32375e843803d06f34a2a4f74eca49be5a3d220c81f0f778d30876c6"
+    EXPECTED_RESPONSE="get_image_published_and_certified_status: Invalid input. Usage: get_image_published_and_certified_status <registry> <repo> <digest> <layerDigestList>"
+    [[ "${EXPECTED_RESPONSE}" = "${output}" && "$status" -eq 2 ]]
+}
+
+@test "Get image published and certified status: no data returned" {
+    layerDigestList=("sha256:14883c6c9fde3cfa1b3708299a4a1171985c67bc582491e97cde04a4aa330ef5" "sha256:51b15c9293c9ad55df1dc4890a6d1e9511cc2ae1853211084fa0f95447e4ee5d")
+    pyxis_response='{
+        "data": {
+            "find_images": {
+                "page": 0,
+                "page_size": 500,
+                "total": 0,
+                "error": null,
+                "data": []
+            }
+        }
+    }'
+
+    run get_image_published_and_certified_status "registry.access.redhat.com" "rhel7/doesnotmatch" "temp:sha256:640e681a32375e843803d06f34a2a4f74eca49be5a3d220c81f0f778d30876c6" "${layerDigestList[@]}"
+    EXPECTED_RESPONSE='{"certified":"Not found","published":"Not found"}'
+    [[ "${EXPECTED_RESPONSE}" = "${output}" && "$status" -eq 0 ]]
+}
+
+@test "Get image published and certified status: match by docker_image_digest" {
+    layerDigestList=("sha256:14883c6c9fde3cfa1b3708299a4a1171985c67bc582491e97cde04a4aa330ef5" "sha256:51b15c9293c9ad55df1dc4890a6d1e9511cc2ae1853211084fa0f95447e4ee5d")
+    pyxis_response='{
+        "data": {
+            "find_images": {
+            "page": 0,
+            "page_size": 500,
+            "total": 205,
+            "error": null,
+            "data": [
+                {
+                "repositories": [
+                    {
+                    "repository": "rhel7/rsyslog",
+                    "registry": "registry.access.redhat.com",
+                    "published": true
+                    }
+                ],
+                "parsed_data": {
+                    "uncompressed_layer_sizes": [
+                    {
+                        "layer_id": "sha256:14883c6c9fde3cfa1b3708299a4a1171985c67bc582491e97cde04a4aa330ef5"
+                    },
+                    {
+                        "layer_id": "sha256:51b15c9293c9ad55df1dc4890a6d1e9511cc2ae1853211084fa0f95447e4ee5d"
+                    }
+                    ]
+                },
+                "docker_image_digest": "temp:sha256:640e681a32375e843803d06f34a2a4f74eca49be5a3d220c81f0f778d30876c6",
+                "certified": false
+                },
+            ]
+            }
+        }
+    }'
+
+    run get_image_published_and_certified_status "registry.access.redhat.com" "rhel7/rsyslog" "temp:sha256:640e681a32375e843803d06f34a2a4f74eca49be5a3d220c81f0f778d30876c6" "${layerDigestList[@]}"
+    EXPECTED_RESPONSE='{"certified":"false","published":"true"}'
+    [[ "${EXPECTED_RESPONSE}" = "${output}" && "$status" -eq 0 ]]
+}
+
+@test "Get image published and certified status: match by layer digests" {
+    layerDigestList=("sha256:14883c6c9fde3cfa1b3708299a4a1171985c67bc582491e97cde04a4aa330ef5" "sha256:51b15c9293c9ad55df1dc4890a6d1e9511cc2ae1853211084fa0f95447e4ee5d")
+    pyxis_response='{
+        "data": {
+            "find_images": {
+            "page": 0,
+            "page_size": 500,
+            "total": 205,
+            "error": null,
+            "data": [
+                {
+                "repositories": [
+                    {
+                    "repository": "rhel7/rsyslog",
+                    "registry": "registry.access.redhat.com",
+                    "published": true
+                    }
+                ],
+                "parsed_data": {
+                    "uncompressed_layer_sizes": [
+                    {
+                        "layer_id": "sha256:14883c6c9fde3cfa1b3708299a4a1171985c67bc582491e97cde04a4aa330ef5"
+                    },
+                    {
+                        "layer_id": "sha256:51b15c9293c9ad55df1dc4890a6d1e9511cc2ae1853211084fa0f95447e4ee5d"
+                    }
+                    ]
+                },
+                "docker_image_digest": "temp:sha256:640e681a32375e843803d06f34a2a4f74eca49be5a3d220c81f0f778d30876c6",
+                "certified": false
+                },
+            ]
+            }
+        }
+    }'
+
+    run get_image_published_and_certified_status "registry.access.redhat.com" "rhel7/rsyslog" "sha256:doesnotmatch" "${layerDigestList[@]}"
+    EXPECTED_RESPONSE='{"certified":"false","published":"true"}'
+    [[ "${EXPECTED_RESPONSE}" = "${output}" && "$status" -eq 0 ]]
+}
+
+@test "handle_pyxis_response_pages handles multiple pages and aggregates results" {
+  query="fake-query"
+  variables_json='{
+    "repo": "rhel7/rsyslog",
+    "registry": "registry.access.redhat.com",
+    "page": 0
+  }'
+
+  url="https://example.com/graphql"
+  http_method="POST"
+  headers_json='{"Content-Type":"application/json"}'
+
+  page1_response='{
+    "data": {
+      "results": {
+        "page": 0,
+        "page_size": 1,
+        "total": 2,
+        "data": [
+          { "docker_image_digest": "sha256:abc123" }
+        ]
+      }
+    }
+  }'
+
+  page2_response='{
+    "data": {
+      "results": {
+        "page": 1,
+        "page_size": 1,
+        "total": 2,
+        "data": [
+          { "docker_image_digest": "sha256:def456" }
+        ]
+      }
+    }
+  }'
+
+  curl() {
+    # Read the input JSON to detect page
+    if grep -q '"page": 0' <<<"$*"; then
+      echo "$page1_response"
+    else
+      echo "$page2_response"
+    fi
+  }
+
+  run handle_pyxis_response_pages "$url" "$http_method" "$headers_json" "$query" "$variables_json"
+
+  EXPECTED_OUTPUT=$'{"docker_image_digest":"sha256:abc123"}\n{"docker_image_digest":"sha256:def456"}'
+
+  echo "Actual output:\n${output}"
+
+  [ "$status" -eq 0 ]
+  [ "$output" = "$EXPECTED_OUTPUT" ]
+}
+
+@test "get_image_published_and_certified_status_two matches by layer digests" {
+  curl() {
+    cat <<EOF
+{
+  "data": {
+    "results": {
+      "total": 1,
+      "page": 0,
+      "page_size": 500,
+      "data": [
+        {
+          "docker_image_digest": "sha256:abc123",
+          "certified": true,
+          "repositories": [
+            {
+              "registry": "my.registry",
+              "repository": "myrepo",
+              "published": true
+            }
+          ],
+          "parsed_data": {
+            "uncompressed_layer_sizes": [
+              { "layer_id": "layer1" },
+              { "layer_id": "layer2" }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}
+EOF
+  }
+
+  run get_image_published_and_certified_status_two "my.registry" "myrepo" "sha256:abc123" "layer1" "layer2"
+
+  echo "Function output:\n${output}"
+
+  [ "$status" -eq 0 ]
+  EXPECTED='{"certified":"true","published":"true"}'
+  [ "$output" = "$EXPECTED" ]
+}
